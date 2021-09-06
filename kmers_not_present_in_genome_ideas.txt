@@ -1,0 +1,91 @@
+Given that there are 4294967296 possible kmers (4^16) for your situation, standard pattern matching will probably be way too slow. I suggest you make a multifasta like
+
+>kmer1
+ATCG....
+>kmer2
+GATA....
+...and pipe this directly into bowtie for alignment against hg38.
+
+Write this python code to a file kmers.py (modified from a solution @ StackExchange and Joe's comment below),
+
+import itertools
+combinations = itertools.product(*itertools.repeat(['A','T','C','G'], 16))
+for i in combinations:
+    print ">"+''.join(i)
+    print(''.join(i))
+and then run:
+
+./kmers.py | bowtie --sam --best --strata -v 0 -n 0 -l 16 -k 1 -m 1 -M 1 -f bowtie_index /dev/stdin | mawk '$1 ~ /^@/ {next} {if ($6 != "16M") print $10}' | tee >(pigz > kmers_notHG38.txt.gz) | wc -l /dev/stdin
+It uses bowtie to align it against hg38, requiring end-to-end alignment and setting all mismatch penalties to maximum strict to only allow exact and full-length matches. Next, it filters for everything that has no perfect match CIGAR (16M) and then save the kmers that are not in hg38 to a file kmers_notHG38.txt.gz. It will also print the numbers of kmers in the output once the job is complete.
+
+If you want to speed up things, bowtie can do multithreading with the -p option.
+
+# generate all possible 12-mer
+# 'expected' must be set as maximum possible (for 12-mer, expected = 4^12)
+awk -v atgc=ATGC -v expected=16777216 -v range=4 'BEGIN{
+  srand(565447);
+  do {
+    seq = substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)
+    if (!(seq in motifs)) {
+      print seq
+      motifs[seq] = 1
+      count++
+    }
+  } while (count < expected)
+}' > all.12mer.out
+
+
+ awk -v atgc=ATGC -v expected=4294967296 -v range=4 'BEGIN{
+      srand(565447);
+      do {
+        seq = substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)substr(atgc,int(1+rand()*range),1)
+        if (!(seq in motifs)) {
+          print seq
+          motifs[seq] = 1
+          count++
+        }
+      } while (count < expected)
+    }' > all.16mer.out
+
+
+#step 2 - separately, tabulate k-mers of the chosen size in the hg38 sequence (just chr22)
+#In this step, the entire target sequence is first flattened and converted to upper case. Then, each found 12-mer #is added to an indexed AWK array, with the entry's value incremented when the same 12-mer is found again. It moves #in a sliding window of 1bp.
+
+samtools faidx hg38.fasta chr22 | \
+awk '{if (NR>1) printf toupper($0)}' | \
+awk '{
+  for (i=1; i<=NF; i+=1)
+    if (i+11<=NF) {
+      m12[$(i)$(i+1)$(i+2)$(i+3)$(i+4)$(i+5)$(i+6)$(i+7)$(i+8)$(i+9)$(i+10)$(i+11)]+=1
+    }
+  } END {
+    for (motif in m12)
+      print motif","m12[motif]
+  }' FS='' > hg38.12mer.out
+
+
+#For 16-mer, you would need to modify to:
+
+if (i+15<=NF) {
+m16[$(i)$(i+1)$(i+2)$(i+3)$(i+4)$(i+5)$(i+6)$(i+7)$(i+8)$(i+9)$(i+10)$(i+11)$(i+12)$(i+13)$(i+14)$(i+15)]+=1
+# change m12 to m16 everywhere else
+# hg38.12mer.out contains each identified 12-mer and its frequency
+
+
+# identify difference between all possible 12-mers and those found in the target sequence
+awk 'NR==FNR {hgmers[$1]; next} !($0 in hgmers)' FS="," hg38.12mer.out all.12mer.out
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

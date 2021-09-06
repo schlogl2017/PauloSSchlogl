@@ -1,0 +1,63 @@
+Porque de estudar os kmers
+
+1. What is the probability of seeing a given k-mer with certain nucleotide 
+probabilities (this is more like a hidden markov model).
+
+2. What is the frequency of seeing a given k-mer in a bag of k-mers, and is 
+that frequency higher or lower than it should be by a null hypothesis? 
+##### meu interesse.
+Think of it as a bag of words problem where you have a bag of k-mers 
+(total # of 7-mers examined in your chromosome) and a draw of a 
+single k-mer is considered a success if it matches the one you want. 
+We can compute the null hypothesis (probability of seeing a 7-mer with 
+equally likely nucleotide choices) as (1 / 4)^k, so in your case, this is: 
+
+P_null = 0.25^7 = 0.000061035
+
+Now, going back to your bag of k-mers, you have observed each of these 7-mers 
+a given number of times. To compute probability based on observations, a 
+total number of words, and the probability of the null, we use the exact 
+binomial test:
+
+for( kmer in all_posible_kmers ) {
+    kmer_results <- binom.test(x = num_observations[kmer],
+                               n = total_num_kmers,
+                               p = 0.000061035,
+                               alternative = 'two.sided')
+    kmer_pvalue <- kmer_results$p.value
+}
+
+x is the number of observations in your data for that given kmer, n is the 
+total number of words (number of trials), and p is the null p. 
+You'll have to construct the loop to iterate over all visited kmer counts
+of interest. You want to consider a two-sided test, since you're interested 
+in higher or lower than the null.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
