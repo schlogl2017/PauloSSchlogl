@@ -1,14 +1,68 @@
 #!usr/bin/env python
 # -*- coding: utf-8 -*-
 
-
+import re
+import os
+import time
+import gzip
+import multiprocessing as mp
 from collections import defaultdict, Counter
 import matplotlib.pyplot as plt
 import numpy as np
 from collections import defaultdict, Counter
 from itertools import product
+from more_itertools import windowed
 import alphabet
-#from fasta_parser import fasta_item_counter, parse_fasta
+from fasta_parser import fasta_item_counter, parse_fasta
+from fasta_parser import parse_fasta
+from markov_models import get_expected_higher_markov, get_variance, get_standard_deviation, z_scores, \
+    get_p_values, get_e_values, gets_selected_kmers
+from system_utils import save_data_frame
+from count_kmers import count_kmers
+from alphabet import iupac_dna
+
+
+def dna_to_rna(seq):
+    """
+    Convert a DNA sequence to RNA.
+    """
+    # Determine if original sequence was uppercase
+    seq_upper = seq.isupper()
+    # Convert to lowercase
+    seq = seq.lower()
+    # Swap out 't' for 'u'
+    seq = seq.replace('t', 'u')
+    # Return upper or lower case RNA sequence
+    if seq_upper:
+        return seq.upper()
+    else:
+        return seq
+
+
+def get_chunks(sequence, window_size, step=1):
+    """Returns a chunk of length of window_size and the end of the window size
+    
+    Inputs:
+        sequence - a string representing a sequence.
+        window_size - integer representing the length of the
+                      chunk/window.
+        step - a interger representing the length of the overlap window.
+    
+    Outputs:
+        chunk - a string of length 'window'.
+        end - a integer representing the end of the chunk.
+    """
+    # get the sequence length
+    k = len(sequence)
+    # get the index for each end and chunk
+    for i in range(0, k - window_size + 1, step):
+        # generate the end of the window
+        end = i + window_size
+        # get the slice of the sequence
+        chunk = sequence[i:i + window_size]
+        # assure the the chunk is the expected size
+        assert len(chunk) == window_size
+        yield chunk, end
 
 
 def get_gc_content(sequence):
@@ -26,7 +80,9 @@ def get_gc_content(sequence):
     """
     # get the sequence length and 
     # make all the sequence characters upper case
-    seq_len, sequence = len(sequence), sequence.upper()
+    seq_len = len(sequence)
+    if not sequence:
+        return 0.0
     # count all gs and cs
     c = sequence.count('C')
     g = sequence.count('G')
@@ -34,6 +90,28 @@ def get_gc_content(sequence):
     # sum up the |Gs and Cs counts and divide 
     # by the sequence length
     return round((c + g) / seq_len, 4)
+
+
+def gc_content(sequence):
+    """
+    Finction to calculate the the gc content of a sequence.
+    
+    Inputs:
+    
+        sequence - a string representing a DNA sequence.
+    
+    Outputs:
+    
+        gc - a float representing the of (g + c) content of a sequence.
+    
+    """
+    # get the sequence length and 
+    # make all the sequence characters upper case
+    seq_len = len(sequence)
+    all_bases = np.array([sequence.count(i) for i in 'ACGT'])
+    cg = np.sum(np.array([sequence.count(i) for i in 'CG']))
+
+    return dict(zip('ACGT', all_bases)), round((cg / seq_len) * 100, 4)
 
 
 def get_at_content(gc):
@@ -407,7 +485,7 @@ def plot_base_frequency_genome(x_data, y_data, x_label, y_label):
     plt.grid(True)
 
 
-def base_content_slide_window(sequence, name, alphabet, window, step, plot=False):
+def base_content_slide_window(sequence, path, name, alphabet, window, step, plot=False):
     """
     Calculates the base/nucleotide frequencies in a window of size window and
     step and make a plot of the base distribution along of the sequence length.
@@ -429,7 +507,7 @@ def base_content_slide_window(sequence, name, alphabet, window, step, plot=False
     """
     # sequence as a string of upper cases characters
     # bases as a set of upper cases characters
-    sequence, bases = sequence.upper(), set(alphabet.upper())
+    sequence, bases = sequence.upper(), alphabet
     # initialize the dictionary container and the array
     base_freqs = defaultdict(list)
     sizes = []
@@ -453,7 +531,7 @@ def base_content_slide_window(sequence, name, alphabet, window, step, plot=False
     if plot:
         plot_base_frequency_genome(sizes, base_freqs, 'Genome (kb)', 'Frequencies')
         plt.title(f"Base Distribuition in {name} genome")
-        plt.savefig(f"{name}_base_freq_slidewindow_plot.pdf")
+        plt.savefig(f"{path}/{name}_base_freq_slidewindow_plot.png")
     # return the data
     return base_freqs, sizes
 
@@ -483,7 +561,7 @@ def strand_stats(sequence, alphabet, start):
     half_gen = (seq_len // 2)
     # get the final position
     ter = (start + half_gen)
-    # initialyze the container
+    # initialize the container
     strand_stat = defaultdict(tuple)
     # for circular genomes
     if ter > seq_len:
@@ -569,7 +647,7 @@ def get_mean_all_kmers_genomes_counts(filenames_lst, alphabet, kmin, kmax):
         Returns - a list of sorted tuples keys-values.
 
     """
-    # initialyze the counter
+    # initialize the counter
     all_kmers = Counter()
     # get the number of files for each genus
     f_len = len(filenames_lst)
@@ -607,7 +685,7 @@ def get_all_possible_kmers(alphabet, kmin, kmax):
     return kmers
 
 
-def count_kmers(sequence, alphabet, kmin, kmax):
+def count_mers(sequence, alphabet, kmin, kmax):
     """Generate all DNA k-mers over the entirety of a sequence, with length
     between kmin and kmax.
 
@@ -677,24 +755,36 @@ def get_kmers_from_sequence(sequence, kmin, kmax):
             yield sequence[i:i + j]
 
 
-def kmer_positions(sequence, alphabet, k):
-    """ returns the position of all k-mers in sequence as a dictionary"""
-    mer_position = defaultdict(list)
-    for i in range(1, len(sequence) - k + 1):
-        kmer = sequence[i:i + k]
-        if all(base in set(alphabet) for base in kmer):
-            mer_position[kmer] = mer_position.get(kmer, []) + [i]
-    # combine kmers with their reverse complements
-    pair_position = defaultdict(list)
-    for kmer, pos in mer_position.items():
-        krev = get_reverse_complement(kmer)
-        if kmer < krev:
-            pair_position[kmer] = sorted(pos + mer_position.get(krev, []))
-        elif krev < kmer:
-            pair_position[krev] = sorted(mer_position.get(krev, []) + pos)
-        else:
-            pair_position[kmer] = pos
-    return pair_position
+def get_pattern_positions(sequence, pattern):
+    """
+    Function to find a pattern in a string.
+    
+    Inputs:
+        
+        sequence - a string representing the sequence/genome.
+        pattern - a substring to be found in the sequence.
+        
+    Outputs:
+    
+        tuple - a tuple with two integers representing the start and end 
+                position of the pattern found in the sequence.
+    OBS: re.finditer return an iterator yielding match objects over all 
+    non-overlapping matches for the RE pattern in string. The string is 
+    scanned left-to-right, and matches are returned in the order found.
+
+
+    """
+    return [pos.span()[0] for pos in re.finditer(r'(' + pattern + ')', sequence)]
+
+
+def get_pattern_count(sequence, pattern):
+    """
+    Return the count the input pattern found in to a give string.
+    :param sequence:
+    :param pattern:
+    :return:
+    """
+    return len(re.findall(r'(?=' + pattern + ')', sequence))
 
 
 def get_kmer_count_slide_window(sequence, alphabet, window, step, kmin, kmax):
@@ -705,10 +795,34 @@ def get_kmer_count_slide_window(sequence, alphabet, window, step, kmin, kmax):
     return slide_mer_count
 
 
-def get_kmer_clumps(sequence, alphabet, k, window, times):
+def get_kmer_clumps(sequence, kmer_list, window, times):
+    """
+    Find clumps of repeated k-mers in string. A clump occurs when times or more 
+    a k-mers appear within a window of size window. A list of (k-mer, position, count) 
+    tuples is returned.
+    
+    Inputs:
+        sequence - a string representing a sequence or a genome.
+        alphabet - a set/list of all the allowed characters in the sequence.
+        k - interger representing the kmers in the sequence. K-mers are 
+            substrings of length k.
+        window - a interger representing the length of the sequence to check by
+                 the kmer clumps.
+        times - a integer representig how many time each kmer must apear in the clump.
+    
+    Outputs:
+         
+         clumps - a dictionary-like object mapping the kmers to their positons and the end
+                   of the clumps.
+        
+    """
+    kmer_pos = defaultdict(list)
+    k = len(kmer_list[0])
     clumps = defaultdict(list)
-    kmers = kmer_positions(sequence, alphabet, k)
-    for kmer, pos in kmers.items():
+    for kmer in kmer_list:
+        kmer_pos[kmer] = kmer_pos.get(kmer, []) + get_pattern_positions(sequence,
+                                                                        kmer)
+    for kmer, pos in kmer_pos.items():
         clumps[kmer] = clumps.get(kmer, [])
         for i in range(len(pos) - times):
             end = i + times - 1
@@ -719,19 +833,6 @@ def get_kmer_clumps(sequence, alphabet, k, window, times):
             if end - i >= times:
                 clumps[kmer].append((pos[i], end - i))
     return clumps
-
-
-def sequence_cleaner(sequence, alphabet):
-    """
-    Clean up a sequence from not allowed characters.
-    Input:
-        sequence - sequence or a string
-    Output:
-        sequence - cleaned sequence or a string
-    """
-    seq = sequence.upper()
-    sequence = [base for base in seq if base in alphabet]
-    return ''.join(sequence)
 
 
 def insert_wild_card(word, num_n=1):
@@ -753,15 +854,15 @@ def insert_wild_card(word, num_n=1):
     """
     mid = len(word) // 2
     # to insert only one wild card character
-    # with a predefinited condiction
+    # with a pre definited condiction: palindrome and even length
     if num_n == 1 and is_palindrome(word) and len(word) % 2 != 0:
         return word[:mid] + 'N' + word[mid + 1:], word
     # the even words can receive two wild card chars
-    # with a predefinited condiction
+    # with a predefinited condiction : palindrome and even length
     elif num_n == 2 and is_palindrome(word) and len(word) % 2 == 0:
         return word[:mid - 1] + 'NN' + word[mid + 1:], word
     # only odd words can return a word with 3 chars wild cards
-    # with a predefinited condiction
+    # with a predefinited condiction: palindrome and odd length
     elif num_n == 3 and word[:mid - 1] == get_reverse_complement(word[mid + 2:]) and len(word) % 2 != 0 and \
             len(word) >= 5:
         return word[:mid - 1] + 'NNN' + word[mid + 2:], word
@@ -811,7 +912,7 @@ def get_counts(filename, alphabet, kmin, kmax):
     """
     # get the list of kmers to count with length between kmin and kmax
     kmers_list = get_all_possible_kmers(alphabet, kmin, kmax)
-    # initialyze the counter with all possible kmer with length
+    # initialize the counter with all possible kmer with length
     # between kmin and kmax with zero counts
     counter = Counter(dict([(km, 0) for km in kmers_list]))
     # open and read in the kmers/string in the file
@@ -833,7 +934,7 @@ def get_counts_from_list(string_list, alphabet, kmin, kmax):
 
     Inputs:
 
-        filename - a complete path to the file.
+        filename - a complete path to the file with th strings to count.
         alphabet - a alphabet (strings characters) that compound the string sequence
         min_k - minimum DNA kmer length (int)
         max_k - maximum DNA kmer length (int)
@@ -845,7 +946,7 @@ def get_counts_from_list(string_list, alphabet, kmin, kmax):
     """
     # get the list of kmers to count with length between kmin and kmax
     kmers_list = get_all_possible_kmers(alphabet, kmin, kmax)
-    # initialyze the counter with all possible kmer with length
+    # initialize the counter with all possible kmer with length
     # between kmin and kmax with zero counts
     counter = Counter(dict([(km, 0) for km in kmers_list]))
     # open and read in the kmers/string in the file
@@ -857,17 +958,888 @@ def get_counts_from_list(string_list, alphabet, kmin, kmax):
     return counter
 
 
-def entropy(sequence):
-    """
-    Calculates the entropy of a sequence.
+def get_mers(sequence, kmin, kmax):
+    """returns the mers of length k obtained from a fasta file with genomes CDS or translated proteins."""
+    for k in range(kmin, kmax + 1):
+        return (''.join(mers) for mers in windowed(sequence, k))
+
+
+def counts(sequence):
+    """ 
+    Find number of occurrences of each value in sequence.
     
     Inputs:
-        sequence - a string that representes the sequence. 
+    
+        sequence - a list or string like object.
     
     Outputs:
-        a float number representing the sequence entropy.       
+    
+        count - a dictionary-like oblect mapping the items
+                in the sequence to their counts (the frequency
+                which they are fount in the sequence).
+                
+    >>> counts(['cat', 'cat', 'ox', 'pig', 'pig', 'cat'])
+    {'cat': 3, 'ox': 1, 'pig': 2}
+    
+    >>> counts('cataa')
+    {'c': 1, 'a': 3, 't': 1}
     """
-    # get the bases counted and the length of the sequence
-    p, lns = Counter(sequence), float(len(sequence))
-    # calculates the sequence entropy
-    return -sum((count/lns) * math.log(count/lns, 2) for count in p.values())
+    # initialize the countainer
+    count = defaultdict(int)
+    # iterates through sequence elements
+    for item in sequence:
+        # if element not in counts add 0
+        # else add 1
+        count[item] = count.get(item, 0) + 1
+    return dict(count)
+
+
+def count_subsequence_in_sliding_window(kmin, kmax, sequence):
+    """ 
+    Count the number of overlapping subsequences of lenght between
+    kmin - kmax in a input sequence.
+    
+    Inputs:
+    
+        sequence - a string object representing a sequence.
+        kmin - a integer representing the lower bound subsequence
+               length.
+        kmax - a integer representing the higher bound subsequence
+               length.
+               
+    Outputs:
+    
+        Yields all subsequences of length between kmin and kmax found
+        in a sequence.
+    
+    >>> list(count_subsequence_in_sliding_window(2, 3, 'ACGTACGTAACCCAGTGACC'))
+    ['AC', 'CG', 'GT', 'TA', 'AC', 'CG', 'GT', 'TA', 'AA', 'AC', 'CC', 'CC', 'CA', 
+    'AG', 'GT', 'TG', 'GA', 'AC', 'CC', 'ACG', 'CGT', 'GTA', 'TAC', 'ACG', 'CGT', '
+    GTA', 'TAA', 'AAC', 'ACC', 'CCC', 'CCA', 'CAG', 'AGT', 'GTG', 'TGA', 'GAC', 'ACC']
+    
+    >>> list(count_subsequence_in_sliding_window(2, 3, 'CCCAGTGACC'))
+    ['CC', 'CC', 'CA', 'AG', 'GT', 'TG', 'GA', 'AC', 'CC', 'CCC', 'CCA', 'CAG', 'AGT', 
+    'GTG', 'TGA', 'GAC', 'ACC']
+    
+    >>> list(count_subsequence_in_sliding_window(2, 3, ' ')) same as kmin, kmax = 0
+    []
+    
+    >>> list(count_subsequence_in_sliding_window(0, 3, 'ACGT'))
+
+    >>> list(count_subsequence_in_sliding_window(2, 2, '1025'))
+    ['10', '02', '25']
+    """
+    if isinstance(sequence, str):
+        for n in range(kmin, kmax + 1):
+            for sub in zip(*(deque(itertools.islice(it, i), 0) or
+                             it for i, it in enumerate(itertools.tee(sequence,
+                                                                     n)))):
+                yield ''.join(sub)
+
+
+def get_gc_strand_difference(sequence, start):
+    seq = sequence.upper()
+    seq_len = len(seq)
+    half = seq_len // 2
+    ter = start + half
+    g, c = 0, 0
+    if ter > seq_len:
+        ter = ter - seq_len + 1
+    elif ter > star:
+        g += 2 * seq[start:ter].count('G') - seq.count('G')
+        c += 2 * seq[start:ter].count('C') - seq.count('C')
+    else:
+        g += seq.count('G') - 2 * seq[start:ter].count('G')
+        c += seq.count('C') - 2 * seq[start:ter].count('C')
+    return g - c
+
+
+def plot_gc_skew(x, y):
+    """Returns a plot of the genome gc skew
+    input: GC_skew(sequence, n)"""
+    plt.figure(num=None, figsize=(24, 7), dpi=100)
+    yargmax = y.index(max(y))
+    plt.axvline(oriCStart + oriOffset, color="r", linestyle='--')
+    plt.axvline(x[yargmax], color="g", linestyle='--')
+    plt.plot(x, y)
+
+
+def get_neighbors(pattern, d):
+    """
+    Function to find a list of all offsets of patterns with hamming distance d of `pattern'.
+    
+    Inputs:
+    
+        pattern - substring represent a pattern
+        d - integer representing the number of allowed charcaters that can be diferent
+            from the pattern to they neighbors.
+    
+    Outputs:
+    
+        neighborhood - a sorted array-list-like object with all neighbors with d 
+                       differences to the pattern.
+    """
+    # if no difference
+    if d == 0:
+        return [pattern]
+    # if no pattern
+    if len(pattern) == 1:
+        return ['A', 'C', 'T', 'G']
+    # initialize the container
+    neighborhood = set()
+    # checking for the suffix patterns
+    neighbors = get_neighbors(pattern[1:], d)
+    # iterates through the neighbors
+    for kmer in neighbors:
+        # check for the allowed distance
+        if hamming_distance(pattern[1:], kmer) < d:
+            # iterates through the charcater/bases
+            for char in ['A', 'C', 'T', 'G']:
+                # add the character to the suffix payyern
+                neighborhood.add(char + kmer)
+        else:
+            # otherwise add the first character again
+            neighborhood.add(pattern[0] + kmer)
+    return sorted(list(neighborhood))
+
+
+def count_sequence_mismatches(seq):
+    """ When passed a string, representing a nucleotide sequence,
+        treats it as a short inverted repeat, and returns the number of 
+        mismatched compared to its reverse complement for half the length
+        of the sequence.
+    
+    Inputs:
+        sequence - a string representing a sequence.
+        
+    Outputs:
+        mismatches - a integer representing the number of counted
+                     differences between the two halfs of the sequence.    
+    """
+    trans_table = str.maketrans('ACGT', 'TGCA')
+    half_len = len(seq) // 2
+    second_half = seq[-half_len:].translate(trans_table)
+    mismatches = 0
+    for i in range(half_len):
+        if seq[i] != second_half[-i - 1]:
+            mismatches += 1
+    return mismatches
+
+
+def combination(n, k):
+    """Combinations of N things taken k at a time.
+    Exact long integer is computed.  Based on function from scipy.
+
+    Notes:
+      - If k > N, N < 0, or k < 0, then a 0 is returned.
+    """
+    if (k > n) or (n < 0) or (k < 0):
+        return 0
+    val = 1
+    for j in range(min(k, N - k)):
+        val = (val * (N - j)) // (j + 1)
+    return val
+
+
+def palindrome_search(sequence, min_len, max_len, alphabet, prob_cutoff=None):
+    """
+    Funtion to define the length of short inverted repeat (SIR) to looking for,
+    with a min_len to max_len range of lengths.
+
+    Inputs:
+    
+        sequence - a string representin a sequence of some length.
+        min_len - a integer representing the minimum length of the 
+                  palindrome.
+        max_len - a integer representing the maximum length of the
+                  palindrome.
+        alphabet - a set/list/string representing all the characters
+                   allowed in a sequence.Ex., 'ACGT' for DNA sequences.
+        prob_cutoff - a float representing the probabilitie of that
+                      paindrome occur given a background composition.
+    
+    Outputs:
+    
+        palindromes - a list/array with the length of the palindrome, 
+        the start position, the probability of the palindrome, the
+        number of mismatches and the palindrome sequence.
+    """
+    # get the sequence complement
+    trans_table = str.maketrans('ACGT', 'TGCA')
+    seq_complement = sequence.translate(trans_table)
+    # gets the base composition
+    nucs = base_stats(sequence, alphabet, False, True)
+    # define maches bases
+    matches = ['AT', 'TA', 'GC', 'CG']
+    # probability of a match according tho the background
+    p_match = 0
+    # iterates tohrough the bases matches
+    for b in matches:
+        # calculate the probabilities
+        p_match += nucs[b[0]] * nucs[b[1]]
+    # checks if the results matches
+    assert p_match == sum([nucs[b[0]] * nucs[b[1]] for b in matches])
+    # initialize the container of possible probability using length and mismatches
+    # as the indexes
+    prob_dict = defaultdict(float)
+    # iterates through the range of lengths
+    for length in range(min_len, max_len):
+        # iterates throught the half of the sequence
+        for mismatches in range(0, (length // 2) + 1):
+            # get the probabilities and number the mismatches
+            p = probability(length, mismatches, p_match)
+            prob_dict[(length, mismatches)] = prob_dict.get((length, mismatches), 0.0) + p
+    # create an container for the results
+    palindromes = []
+    # iterates through the range of lengths
+    for length in range(min_len, max_len):
+        # defined mismatch threshold
+        half_l = length // 2
+        mismatches_cutoff = 0.5 * half_l
+        half_list = range(half_l)
+        # iterates throught to find the starts
+        for start in range(0, (len(sequence) - length + 1)):
+            # gets the putative palindromes
+            seq = sequence[start:start + length]
+            # gets the complement
+            seq_comp = seq_complement[start:start + length]
+            mismatches = 0
+            # iterates throught the half lengths
+            for i in half_list:
+                # check for mismatches and increment the counts
+                if seq[i] != seq_comp[-i - 1]:
+                    mismatches += 1
+            # check if the number of mismatches is allowed
+            if mismatches <= mismatches_cutoff:
+                # look up the probability,
+                pr = prob_dict[(length, mismatches)]
+                # if it passes the cutoff
+                if pr <= prob_cutoff:
+                    # add the results into the container
+                    # count the number of the palindrome in the sequence
+                    cnt_pal = get_pattern_count(sequence, seq)
+                    palindromes += [[length, start, pr, mismatches, cnt_pal, seq]]
+    return palindromes
+
+
+def write_palindromes_to_file(path, csv_name, results):
+    """ 
+    Function to save the palindrome search result as a csv.
+    
+    Inputs:
+        outfilename - the name of the final csv.
+        results - a list of lists with the results of the palindrome
+                  search. The data is the length, start position,
+                  the probability of the palindrome, the mismatches number,
+                  and the palindrome sequence.
+    Outputs:
+        A compressed or only a csv file.
+    """
+    if not os.path.exists(path):
+        os.makedirs(path)
+    df = pd.DataFrame(results, columns=['length',
+                                        'start',
+                                        'probability',
+                                        'mismatches',
+                                        'count',
+                                        'sequence']).sort_values(by='probability').reset_index(drop=True)
+    csv_name = f'{csv_name}_pal_search.csv'
+    df.to_csv(f'{path}/{csv_name}.gz', index=False, compression='gzip')
+
+
+def repeated_palindrome(palindromes_list):
+    """
+    Function to search through a data set (list of list) if one of the
+    palindromes sequence has insert in it another palindrome.
+    For example, if M is the longer palindrome sequence, if the p start > m start 
+    and p end <  m end, p is inside m. The output file should be a new 
+    data set containing only unique palindrome derived from the content of the input file
+    
+    Inputs:
+        palindrome_list - a list containing the palindrome data as: 
+        [[length, start, probability, mismatches, count, sequence]]
+        
+    Outputs:
+        pal_list - a new palindrome list with unique palindromes as:
+        [[length, start, probability, mismatches, count, sequence]]
+    """
+    # the list is ordered in the reversed form (long to short)
+    ordered_palindrome = sorted(palindromes_list)
+    longest_first = ordered_palindrome[::-1]
+    # initialize a new list to receive unique plaindromes data
+    pal_list = [longest_first[0]]
+    # the longest palindrome cannot fit in any other sequence 
+    # iterates over the longest_first original palindromes
+    # get the start and end positions   
+    for data in longest_first:
+        start = data[1]
+        end = start + data[0]
+        # iterate through the pal_list and 
+        # compare the start and end of the potential and palindromes 
+        # to check if the potential palindrome is unique.
+        unique_palindrome = None
+        for dat in pal_list:
+            start_unique = dat[1]
+            end_unique = start_unique + dat[0]
+            #  statement should test to check if the test palindrome fits
+            # inside any of the identified 'real/unique' palindromes.
+            if start >= start_unique and end <= end_unique:
+                # if the palindrome tested fits inside
+                unique_palindrome = False
+                break
+            else:
+                # other wise it is unique
+                unique_palindrome = True
+        if unique_palindrome:
+            # check if if it is not in the list
+            if data not in pal_list:
+                pal_list += [data]
+    return pal_list
+
+
+def check_the_palindromes_starts(palindromes_list):
+    """ 
+    This is a function to return start position minus start positions
+    in an ordered data set of identified palindromes.
+    """
+    # to get all the start positions
+    starts = [(s[1]) for s in palindromes_list]
+    # all the data sorted
+    palin = palindromes_list[1:]
+    sorted(palin)
+    # the sorted function orders the list for low to high
+    longest_ordered = sorted(starts, reverse=True)
+    # empty list to append the results to
+    data = []
+    # iteration through the start positions to return the results of the start
+    # position minus the next start position in the list
+    for i in range(len(longest_ordered) - 1):
+        j = i + 1
+        value = longest_ordered[i] - longest_ordered[j]
+        data.append(value)
+    return data
+
+
+def get_cds_start_end_locations_genbank_file(filename):
+    """
+    Function to look for start and end of CDS feature in genbank record. 
+    
+    Inputs:
+        filename - a path or locations of the genbank file.
+    
+    Outputs:
+        genes - a dictionary like object that map CDS/genes to their
+                locations in a genome.
+    """
+    # Loop over the features
+    genes = defaultdict(list)
+    cds = 0
+    for seq_record in SeqIO.parse(filename, "genbank"):
+        print(f'Dealing with GenBank record {seq_record.id}')
+        for seq_feature in seq_record.features:
+            if seq_feature.type == "CDS" and 'protein_id' in seq_feature.qualifiers:
+                cds += 1
+                prot_id = seq_feature.qualifiers['protein_id'][0]
+                start, end = int(seq_feature.location.start), int(seq_feature.location.end)
+                genes[prot_id] = genes.get(prot_id, []) + [start, end]
+    print(f'There are {cds} CDS and {len(genes)} genes annoted for this genbank record')
+    return genes
+
+
+def final_kmer_counts(seq_dict, num_seqs, min_k, max_k):
+    """Function to count all the kmers found in a determinated sequence.
+    
+    Inputs:
+    
+        seq_dict - a dictionary-like object where keys are sequence ids and
+                   values are the sequence itself.
+                   
+        num_seq - it a integer that represents the number of sequences that
+                  are used to count the kmers
+        
+        alphabet - it is a string that represents the allowed characters
+                   that compose the sequence. Ex: 'ACGT' for DNA sequences.
+        
+        min_k - minimum mer length (int)
+        
+        max_k - maximum mer length (int)
+    
+    Outputs:
+        A tuple as:
+         
+             final_count - a dictionary-type with k-mers as keys and counts as values.
+                           The final value is the average of counts from the total number
+                           of sequences used to produce the counts.
+             total_len - sum length is the average length of the sequences lengths 
+    """
+    counted = Counter()
+    len_seqs = 0
+    for name, sequence in seq_dict.items():
+        len_seqs += len(sequence)
+        counted.update(count_kmers_cython(sequence, min_k, max_k))
+    final_count = {k: (v // num_seqs) for k, v in counted.items()}
+    # total_len = (len_seqs // num_seqs)
+    return final_count, len_seqs
+
+
+def count_n_grams_fasta(fasta_dict, name, kmin, kmax):
+    """
+    Function to count all n-grams/k-mers (substrings of lenght n or k) in a
+    big string/genome.
+
+    Inputs:
+        fasta_dict - a dictionary-like object that map a word/kmer to their value,
+                    in this case a full path to the files to be analized.
+        name - a string representing a word (key) that represent a key in a
+               dictionary.
+        kmin - a integer representing the lower bound of the kmer/n-gram length.
+        kmax - a integer representing the maximum bound of the kmer/n-gram length.
+
+    Outputs:
+        final_counter - a dictionary-like mapping the kmers to their calculated count
+                        in the input string, from a file.
+    """
+    # get the number of files in the names directory
+    num_fastas = len(fasta_dict[name])
+    # initialize the counter
+    counter = Counter()
+    # iterates through the list of paths
+    for filename in fasta_dict[name]:
+        # reads the file and parse the content
+        print(f'Reading and parsing the filename {filename}')
+        for name, sequence in parse_fasta(filename):
+            # counting the kmers
+            cnt = count_kmers(sequence, kmin, kmax, counter=None)
+            # add the count of the current file to the counter
+            counter.update(cnt)
+    # to get the mean of the kmer count for all the files
+    final_counter = {k: (c // num_fastas) for k, c in counter.items()}
+    return final_counter
+
+
+def cleaning_ambiguous_bases(seq):
+    """
+    Function to clean up all umbigous bases in a sequence.
+    Ambigous bases are bases that are not in the sequence
+    alphabet, ie. 'ACGT' for DNA sequences.
+
+    Inputs:
+
+        sequence - a string representing a DNA sequence.
+
+    Outputs:
+
+        integer - a new clean up string representing a DNA sequence
+                  without any ambiguous characteres.
+    """
+    # compile the regex with all ambiguous bases
+    pat = re.compile(r'[NRYWXSKM]')
+    # look for the ambiguous bases and replace by
+    # nothing
+    return re.sub(pat, '', seq)
+
+
+def check_and_clean_sequence(sequence, alphabet):
+    """
+    Function to check and clean up all umbigous bases in a sequence.
+    Ambigous bases are bases that are not in the sequence
+    alphabet, ie. 'ACGT' for DNA sequences.
+
+    Inputs:
+
+        sequence - a string representing a DNA sequence.
+
+    Outputs:
+
+        cleaned_sequence - cleaned sequence or a string.
+    """
+    if set(sequence).issubset(alphabet):
+        return sequence
+    else:
+        return cleaning_ambiguous_bases(sequence)
+
+
+def cleaning_sequence_regex(sequence):
+    """
+    Function to check and clean up all umbigous bases in a sequence.
+    Ambigous bases are bases that are not in the sequence
+    alphabet, ie. 'ACGT' for DNA sequences.
+
+    Inputs:
+
+        sequence - a string representing a DNA sequence.
+
+    Outputs:
+
+        cleaned_sequence - cleaned sequence or a string.
+    """
+    amb = re.compile(r"[^ACGT]")
+    return amb.sub("", sequence)
+
+
+def get_seq_length(path_dict):
+    seq_len = 0
+    num_seqs = 0
+    names = path_dict.keys()
+    name = ''
+    for name in names:
+        name += name
+        num_seqs += len(path_dict[name])
+        for filename in path_dict[name]:
+            for ID, seq in parse_fasta(filename):
+                seq_len += len(seq)
+    return name, int(seq_len / num_seqs)
+
+
+def get_kmer_count_from_csv(filename):
+    """
+    Gets the count of all kmers from a csv file.
+    
+    Inputs:
+        filename - a string representing a complete pathway to the csv file.
+        
+    Outputs:
+        kmer_counts - a dictionary-like object mapping the kmers ( a substring of length k)
+                      to a integer representing the number of time the kmer was counted
+                      in a string.
+    """
+    # initialize the dicitonary/container
+    kmer_counts = dict()
+    # check if the file is compressed
+    name, extension = os.path.splitext(filename)
+    # if file compressed
+    if extension == '.gz':
+        opener = gzip.open(filename, 'rt')
+    # if not compressed
+    else:
+        opener = open(filename, 'r')
+    # open the compressed csv file
+    with opener as file:
+        # skip the header
+        header = file.readline()
+        # iterates through the lines
+        for line in file:
+            # strip spaces and split the lines in the delimiter
+            (key, val) = line.strip('\n').split(",")
+            # add the key and the val to the dicitonary
+            kmer_counts[key] = int(val)
+    return kmer_counts
+
+
+def get_fasta_sequence_length(fasta_dict):
+    """
+    Calculates the sequence length from all fasta files.
+    
+    Inputs:
+        fasta_dict - a dictionary-like object
+    """
+    dict_len = defaultdict(list)
+    for name, filename in data_generator(fasta_dict):
+        dict_len[name] = dict_len.get(name, [])
+        for _, seq in parse_fasta(filename):
+            dict_len[name] += [len(seq)]
+    return {k: sum(cnt) // len(cnt) for k, cnt in dict_len.items()}
+
+
+def get_kmer_stats(seq_len_dict,
+                   csv_files,
+                   kmer_list,
+                   dir_out,
+                   sub_dir,
+                   sub_sub_dir,
+                   kmax,
+                   eval_cutoff):
+    names = sorted(seq_len_dict.keys())
+    print(f'The number of genus that have being analyzed is {len(names)}')
+    for name in names:
+        kmer_counts = get_kmer_count_from_csv(csv_files[name])
+        seq_len = int(seq_len_dict[name])
+        expected_mers = get_expected_higher_markov(kmer_list, kmer_counts)
+        variance = get_variance(kmer_list, seq_len, expected_mers)
+        std = get_standard_deviation(variance)
+        z_scr = z_scores(expected_mers, kmer_counts, std)
+        p_val = get_p_values(z_scr)
+        e_val = get_e_values(kmer_list, p_val)
+        print(f'The number of kmers checked with {kmax} lengths were {len(kmer_list)}')
+        df_selected, df_to_check = gets_selected_kmers(kmer_list,
+                                                       kmer_counts,
+                                                       expected_mers,
+                                                       z_scr,
+                                                       p_val,
+                                                       e_val,
+                                                       eval_cutoff)
+        print(f'The number of selected kmers with e-values {eval_cutoff} were {df_selected.shape[0]}')
+        save_data_frame(df_selected, dir_out, name, sub_dir, sub_sub_dir, kmax, 'selected')
+        save_data_frame(df_to_check, dir_out, name, sub_dir, sub_sub_dir, kmax, 'to_check')
+
+
+def get_palindromes(alphabet, min_k, max_k):
+    """Generates all DNA palindromes over the range from min_k to max_k.
+    Inputs:
+    min_k - minimum palindrome length (int)
+    max_k - maximum palindrome length (int)
+    Output:
+    yields all possible DNA palindromes (str) of length min_k to max_k.
+    Some definitions:
+    A palindrome is defined as a sequence which is equal to its reverse-complement.
+    Note: for odd length palindromes, the middle base does not need to be the same
+    in the reverse-complement.
+    Ex.: AAT is a legal palindrome even though its reverse-complement is ATT
+    """
+    for k in range(min_k, (max_k + 1)):
+        for mer in product(alphabet, repeat=int(k / 2)):
+            kmer = ''.join(mer)
+            # even pal
+            if k % 2 == 0:
+                pal = kmer + get_reverse_complement(kmer)
+                yield pal
+            else:
+                for base in alphabet:  # odd pal
+                    pal = kmer + base + get_reverse_complement(kmer)
+                    yield pal
+
+
+def get_kmers_count(sequence, kmin, kmax, overlap, nprocs=None):
+    """
+    Counts the number of k-mers of a specified length in a given sequence
+    :param overlap:
+    :param kmin:
+    :param kmax:
+    :param sequence: string representation of a sequence
+    :param nprocs: number of processors to use
+    :return: collections.Counter (dictionary) object indexed by k-mer and mapped to number of occurences
+    """
+    start = time.time()
+    if nprocs is None:
+        nprocs = mp.cpu_count()
+    args = split_seq(sequence, nprocs, overlap)
+    args = [[seq, kmin, kmax] for seq in args]
+    pool = mp.Pool(nprocs)
+    results = [res.get() for res in [pool.starmap_async(count_kmers, args)]]
+    pool.close()
+    counts = Counter()
+    for result in results[0]:
+        for k, v in result.items():
+            counts[k] += v
+    end = time.time()
+    print("Done counting kmers in " + str(round(end - start, 4)))
+    return counts
+
+
+def count_k_mers_fasta(fasta_dict, name, alphabet, kmin, kmax, overlap, nprocs=None):
+    """
+    Function to count all n-grams/k-mers (substrings of lenght n or k) in a
+    big string/genome.
+
+    Inputs:
+        fasta_dict - a dictionary-like object that map a word/kmer to their value,
+                    in this case a full path to the files to be analized.
+        name - a string representing a word (key) that represent a key in a
+               dictionary.
+        kmin - a integer representing the lower bound of the kmer/n-gram length.
+        kmax - a integer representing the maximum bound of the kmer/n-gram length.
+
+    Outputs:
+        final_counter - a dictionary-like mapping the kmers to their calculated count
+                        in the input string, from a file.
+        seq_length - a integer representing the mean of the lengths from all genomes
+                     files in the directory.
+    """
+    # alphabet as a set
+    alphabet = set(alphabet)
+    # get the number of files in the names directory
+    num_fastas = len(fasta_dict[name])
+    print(f'The number of fasta files for this genus is {num_fastas}.')
+    # initialize the counter
+    counter = Counter()
+    # get the sequence length
+    seq_len = 0
+    num_files = 0
+    # iterates through the list of paths
+    for filename in fasta_dict[name]:
+        # reads the file and parse the content
+        print(f'Reading and parsing the file {filename}')
+        for name, sequence in parse_fasta(filename):
+            print(f'Sequence length {len(sequence)}')
+            seq_len += len(sequence)
+            # get the counting the kmers
+            cnt = get_kmers_count(sequence, kmin, kmax, overlap, nprocs)
+            # add the count of the current file to the counter
+            counter.update(cnt)
+        num_files += 1
+    # to get the mean of the kmer count for all the files
+    final_counter = {k: (c // num_fastas) for k, c in counter.items() if set(k).issubset(alphabet)}
+    # get mean of genomes lengths
+    seq_length = int(seq_len / num_files)
+    return final_counter, seq_length
+
+
+def split_seq(sequence, nprocs, overlap=None):
+    """
+    :param sequence: string sequence to split
+    :param nprocs: number of CPUs to use
+    :param overlap: for use when counting k-mers. If considering 3-mers, overlap=3
+    :return: a list of 'nprocs' roughly equal chunks to pass as an argument to python multiprocessing
+    """
+    chunk_size = int(len(sequence) / nprocs) + 1
+    args = []
+    start = 0
+    end = chunk_size
+    for proc in range(nprocs):
+        if overlap is not None:
+            args.append(sequence[start:(end + overlap - 1)])
+        else:
+            args.append(sequence[start:end])
+        start = end
+        end += chunk_size
+        if end > len(sequence):
+            end = len(sequence)
+    return args
+
+
+def count_pyr_pur(sequence):
+    """
+    Function to count the number of pyrimidines (U, T, C) and
+    purines (A, G) in a sequence.
+    
+    Inputs:
+        sequence - a string representing a sequence. It also
+                   could be a list/array of string characters, but
+                   this will be treated as a string.
+    
+    Outputs:
+        bases - a dictionary-like object mapping the purines and
+                pyrimidines to their counts.
+    EX:
+    >> count_pyr_pur('AAAGGGGGTT')
+    {'purines': 8, 'pyrimidines': 2}
+    
+    >> count_pyr_pur('AAAGUGGUGGU')
+    {'purines': 8, 'pyrimidines': 3}
+    
+    >> count_pyr_pur('')
+    {'purines': 0, 'pyrimidines': 0}
+    
+    >> count_pyr_pur('ActGccA')
+    {'purines': 3, 'pyrimidines': 4}
+    
+    >> count_pyr_pur(['a', 'c', 'g', 'A'])
+    count_pyr_pur(['a', 'c', 'g', 'A'])
+    
+    >> count_pyr_pur([])
+    {'purines': 0, 'pyrimidines': 0}
+    """
+    seq = ''
+    pur = 0
+    pyr = 0
+    check_list = isinstance(sequence, list)
+    if check_list:
+        seq += ''.join(sequence).upper()
+    else:
+        seq += sequence.upper()
+    for base in seq:
+        if base in 'UTC':
+            pyr += 1
+        elif base in 'AG':
+            pur += 1
+    return {'purines': pur, 'pyrimidines': pyr}
+
+
+def longest_common_substring(seq1, seq2):
+    """
+    Function to find the longest common substring that is shared
+    by two sequences.
+    
+    Inputs:
+        seq1 - a string representing the first sequence.
+        seq2 - a string representing the second sequence.
+    
+    Outputs:
+        lcs - a string representing the longest shared substring
+              if there are any.
+    
+    EX:
+    >> longest_common_substring('ACGTGGAAAGCCA', 'GTACACACGTTTTGAGAGACAC')
+    'ACGT'
+    
+    >> longest_common_substring('apples', 'appleses')
+    'apples'
+    
+    >> longest_common_substring('GATGCCATGCA', 'ATGCC')
+    'ATGCC'
+    
+    >> longest_common_substring('ATGC', 'ATGCA')
+    'ATGC'
+    
+    >> longest_common_substring('', 'ATGCA')
+    ''
+    
+    >> longest_common_substring('CCCGTT', 'AAAAAAAAA')
+    ''
+    """
+    # assert the small sequence to be the shortest
+    if len(seq1) > len(seq2):
+        seq1, seq2 = seq2, seq1
+    # start with the entire sequence and the shorten
+    k = len(seq1)
+    while k > 0:
+        # check for all substrings
+        for i in range(len(seq1) - k + 1):
+            kmer = seq1[i:i + k]
+            if kmer in seq2:
+                return kmer
+        k -= 1
+    # If we haven't returned, there is no common substring
+    return ''
+
+
+def restriction_sites_regex(sequence, recog_site):
+    """
+    Find the start indices of restriction sites in a sequence.
+
+    Inputs:
+        sequence - a string representing a sequence.
+        recog_site - a string representing a restriction recognition site.
+
+    Outputs:
+        a list/array-like object with all start positions from the
+        restriction enzyme recognition site.
+
+    EX:
+    >> seq = lambda fasta
+    https://www.neb.com/-/media/nebus/page-images/tools-and-resources/interactive-tools/\
+    dna-sequences-and-maps/text-documents/lambdafsa.txt
+    >> restriction_sites_regex(seq, 'AAGCTT')
+     [23129, 25156, 27478, 36894, 37458, 37583, 44140]
+
+    >> restriction_sites_regex(seq, 'GAATTC')
+    [21528, 26475, 32199, 39726, 45613]
+
+    >> restriction_sites_regex(seq, 'GGTACC')
+    [17295, 18820]
+
+    >> restriction_sites_regex(seq, '')
+    -1
+
+    >> restriction_sites_regex('', 'GGTACC')
+    -1
+    """
+    # sequence and patter to upper case
+    sequence, recog_site = sequence.upper(), recog_site.upper()
+    # compile the pattern
+    rec_site = re.compile(recog_site)
+    # if not find any seq or patter returns -1
+    # to keep the python pattern
+    if recog_site == '' or sequence == '':
+        return -1
+    # if found returns a tuple of the site and its start positions
+    return [rec.start() for rec in re.finditer(rec_site, sequence)]
+
+
+def all_re_cut_sites(sequence, cut_sites_list):
+    sites = []
+    for cut in cut_sites_list:
+        p = restriction_sites_regex(sequence, cut)
+        if p:
+            sites.append((cut, p))
+    return sites
