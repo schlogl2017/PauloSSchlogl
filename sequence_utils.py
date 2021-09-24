@@ -1837,9 +1837,121 @@ def restriction_sites_regex(sequence, recog_site):
 
 
 def all_re_cut_sites(sequence, cut_sites_list):
+    """
+    Function to find all restriction sites in a sequence.
+    
+    Inputs:
+        sequence - a string representing a sequence.
+        cut_sites_list - a list of cut sites patterns as regex
+    
+    Outputs:
+        sites - a list of tuple objects with the cut sites and it start positions
+    """
     sites = []
+    # iterates through the cut site lists
     for cut in cut_sites_list:
+        # find all the matchs and its positions
         p = restriction_sites_regex(sequence, cut)
+        # if found
         if p:
+            # add to the container
             sites.append((cut, p))
     return sites
+    
+    
+def kmer_map(sequence, k):
+    """
+    Function to find the kmer positions in a sequence.
+    
+    Inputs:
+        sequence - a string representing a sequence
+        k - a integer representing the length of the
+            substrings.
+    
+    Outputs:
+        kmermap - a dictionary-like object mapping the
+                  substrings of k length and they positions
+                  in the sequence.
+    Ex:
+    >> kmer_map('ATTGATTATTG', 3)
+    defaultdict(list,
+            {'ATT': [0, 4, 7],
+             'TTG': [1, 8],
+             'TGA': [2],
+             'GAT': [3],
+             'TTA': [5],
+             'TAT': [6]})
+    """
+    # get the length through iterate over
+    seq_len = len(sequence) - k + 1
+    # get the container fro the data
+    kmermap = defaultdict(list)
+    # iterates through the sequence length
+    for i in range(seq_len):
+        # get the kmer as keys and positions
+        # as values
+        kmermap[sequence[i:i+k]].append(i)
+    return kmermap    
+    
+    
+def get_slide_window(sequence, window_size, step=1):
+    """
+    Function that get a subsequence of window_size with overlapps
+    of size step. It doesn't care about the sequence that doesn't
+    have the full window size length.
+    
+    Inputs:
+        sequence - a string representing a sequence
+        window_size - a integer representing the length of the
+                      window.
+        step - a integer representing the overlapp size of
+               the sequence windows.
+    
+    Outputs:
+        yields the start, end and substrings of length i, j
+    """
+    sequence, seq_size = sequence.upper(), len(sequence)
+    for i in range(0, seq_size, step):
+        j = i + window_size
+        yield i, j, sequence[i:j]    
+    
+    
+def kmer_position_window_sized_sequence(sequence, k, window_size=10, step=5):
+    '''Return a iterator that yelds(start, end, property) tuple.
+    start and end used to slice de sequence and property is the result of the
+    function
+    Ex.
+    sequence = "attagcgcaatctaactacactactgccgcgcggcatatatttaaatata"
+    for start, end, gc in sliding_window_analysis(sequence, gc_content):
+        print(start, end, gc)'''
+    sequence = sequence.upper()
+    for start in range(0, len(sequence), step):
+        end = start + window_size
+        if end > len(sequence):
+            break
+        yield  start, end, kmer_map(sequence[start:end], k)    
+    
+    
+def get_pur_pyr_counts(sequence):
+    """
+    Function to calculate the frequency of purines (A or G) and
+    pyrimidines (T, C or U) in a sequence.
+    
+    Inputs:
+        sequence - a stringt object representing a sequence (DNA,
+        RNA).
+    
+    Outputs:
+        pur - a integer number representing the total number of
+              purines in a sequence.
+        pyr - a integer number representing the total number of
+              pyrimidines in a sequence.
+    """
+    pur = sequence.count('A') + sequence.count('G')
+    pyr = sequence.count('T') + sequence.count('C') + sequence.count('U')
+    return pur, pyr    
+    
+    
+    
+    
+    
